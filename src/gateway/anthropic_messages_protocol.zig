@@ -540,7 +540,8 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         try writer.writeByte(']');
         // Anthropic defaults tool_choice to auto. `none` is expressed by omitting
         // tools entirely; `any` must always be sent for required calls.
-        if (options.tool_choice_mode == .send or request.tool_choice == .required) {
+        const parallel_disabled = request.provider_options.parallel_tool_calls == false;
+        if (options.tool_choice_mode == .send or request.tool_choice == .required or parallel_disabled) {
             const kind: []const u8 = switch (request.tool_choice) {
                 .auto => "auto",
                 .none => unreachable,
@@ -548,16 +549,20 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             };
             try writer.writeAll(",\"tool_choice\":{\"type\":");
             try std.json.Stringify.value(kind, .{}, writer);
+            if (parallel_disabled) try writer.writeAll(",\"disable_parallel_tool_use\":true");
             try writer.writeByte('}');
         }
     }
-    if (request.provider_options.reasoning) |effort| {
-        if (!effort.isDefault()) {
-            const budget = @min(thinking_budget_tokens, @max(min_thinking_budget_tokens, max_tokens / 2));
-            try writer.writeAll(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":");
-            try std.json.Stringify.value(budget, .{}, writer);
-            try writer.writeByte('}');
-        }
+    // Forced tool use (`tool_choice:any`) is rejected alongside thinking, so
+    // required calls keep their contract and skip the budget instead. The API
+    // also requires budget_tokens < max_tokens with a floor of
+    // min_thinking_budget_tokens, which small output limits cannot satisfy.
+    const wants_thinking = if (request.provider_options.reasoning) |effort| !effort.isDefault() else false;
+    if (wants_thinking and request.tool_choice != .required and max_tokens > min_thinking_budget_tokens) {
+        const budget = @min(thinking_budget_tokens, @max(min_thinking_budget_tokens, max_tokens / 2));
+        try writer.writeAll(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":");
+        try std.json.Stringify.value(budget, .{}, writer);
+        try writer.writeByte('}');
     }
     try writer.writeByte('}');
 }
@@ -807,7 +812,7 @@ const Reducer = struct {
             const signature_field = delta.object.get("signature") orelse return error.InvalidChunk;
             if (signature_field != .string) return error.InvalidChunk;
             const entry = self.thinking.getPtr(index) orelse return error.InvalidChunk;
-            if (entry.signature.items.len + signature_field.string.len > self.limits.identity_bytes) return error.StreamTooLarge;
+            if (entry.signature.items.len + signature_field.string.len > self.limits.thinking_bytes) return error.StreamTooLarge;
             try entry.signature.appendSlice(alloc, signature_field.string);
         } else if (std.mem.eql(u8, kind, "input_json_delta")) {
             const json_field = delta.object.get("partial_json") orelse return error.InvalidChunk;
@@ -890,6 +895,14 @@ const Reducer = struct {
         const provider_state = try self.mint_state(alloc);
         errdefer if (provider_state) |state| alloc.free(state);
         const owned_calls = try calls.toOwnedSlice(alloc);
+        errdefer {
+            for (owned_calls) |call| {
+                alloc.free(call.id);
+                alloc.free(call.name);
+                alloc.free(call.arguments_json);
+            }
+            alloc.free(owned_calls);
+        }
         const content = if (self.completion_text.items.len != 0) try self.completion_text.toOwnedSlice(alloc) else null;
         errdefer if (content) |text| alloc.free(text);
         const generation_id = self.generation_id;
@@ -954,7 +967,7 @@ fn finish_reason_for(raw: ?[]const u8, has_tools: bool) types.ProviderFinishReas
     const reason = raw orelse return if (has_tools) .tool_calls else .stop;
     if (std.mem.eql(u8, reason, "end_turn")) return if (has_tools) .tool_calls else .stop;
     if (std.mem.eql(u8, reason, "stop_sequence")) return .stop;
-    if (std.mem.eql(u8, reason, "max_tokens")) return .length;
+    if (std.mem.eql(u8, reason, "max_tokens") or std.mem.eql(u8, reason, "model_context_window_exceeded")) return .length;
     if (std.mem.eql(u8, reason, "refusal")) return .content_filter;
     if (std.mem.eql(u8, reason, "pause_turn")) return .other;
     return if (has_tools) .tool_calls else .stop;
@@ -1092,6 +1105,52 @@ test "reasoning effort writes a bounded thinking budget" {
 test "default effort omits the thinking block" {
     const messages = [_]types.ChatMessage{user_message("hi")};
     const request = stream_provider.RequestData{ .model = "claude-sonnet-4-5", .messages = &messages, .tool_choice = .auto, .provider_options = .{} };
+    const body = try build_request(test_alloc, request, test_options());
+    defer test_alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "thinking") == null);
+}
+
+test "required tool choice keeps tool_choice:any and skips thinking" {
+    const functions = [_]model_tool_schema.FunctionSchema{.{ .name = "read_file", .description = "Read a file" }};
+    const messages = [_]types.ChatMessage{user_message("hi")};
+    const request = stream_provider.RequestData{
+        .model = "claude-sonnet-4-5",
+        .messages = &messages,
+        .tool_choice = .required,
+        .tools = .{ .additional_functions = &functions },
+        .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high") },
+        .max_output_tokens = 16 * 1024,
+    };
+    const body = try build_request(test_alloc, request, test_options());
+    defer test_alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":{\"type\":\"any\"}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "thinking") == null);
+}
+
+test "parallel tool call opt-out forces an explicit tool_choice" {
+    const functions = [_]model_tool_schema.FunctionSchema{.{ .name = "read_file", .description = "Read a file" }};
+    const messages = [_]types.ChatMessage{user_message("hi")};
+    const request = stream_provider.RequestData{
+        .model = "claude-sonnet-4-5",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .tools = .{ .additional_functions = &functions },
+        .provider_options = .{ .parallel_tool_calls = false },
+    };
+    const body = try build_request(test_alloc, request, test_options());
+    defer test_alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":{\"type\":\"auto\",\"disable_parallel_tool_use\":true}") != null);
+}
+
+test "thinking is omitted when max_tokens cannot exceed the budget floor" {
+    const messages = [_]types.ChatMessage{user_message("hi")};
+    const request = stream_provider.RequestData{
+        .model = "claude-sonnet-4-5",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high") },
+        .max_output_tokens = 512,
+    };
     const body = try build_request(test_alloc, request, test_options());
     defer test_alloc.free(body);
     try std.testing.expect(std.mem.find(u8, body, "thinking") == null);
